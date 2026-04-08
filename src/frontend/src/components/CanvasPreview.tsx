@@ -170,6 +170,7 @@ function initRainColumns(
 }
 
 // ---- Update rain columns (delta-time based) ----
+// nextCharIndexRef is a { value: number } box so we can mutate it from outside
 function updateRainColumns(
   columns: RainColumn[],
   dt: number,
@@ -177,9 +178,9 @@ function updateRainColumns(
   fontSize: number,
   charPool: string,
   speedMultiplier: number, // 0..1 mapped from speed slider
-  isPlaying: boolean,
+  nextCharIndexRef: { value: number },
 ): void {
-  if (!isPlaying || charPool.length === 0) return;
+  if (charPool.length === 0) return;
 
   const charH = fontSize * 1.35;
   const minSpeed = charH * (0.5 + speedMultiplier * 2.5); // px/sec
@@ -208,7 +209,9 @@ function updateRainColumns(
         // high probability when timer fires
         const speed = minSpeed + Math.random() * (maxSpeed - minSpeed);
         const length = minLen + Math.floor(Math.random() * (maxLen - minLen));
-        const charOffset = Math.floor(Math.random() * poolLen);
+        // Sequential charOffset: pick up exactly where the last drop left off
+        const charOffset = nextCharIndexRef.value % poolLen;
+        nextCharIndexRef.value = (nextCharIndexRef.value + length) % poolLen;
         col.drops.push({
           y: -charH, // start above the canvas
           speed,
@@ -231,9 +234,8 @@ function drawRainColumns(
   fontSize: number,
   fgColor: string, // hex
   opacity: number, // 0..1
-  isPlaying: boolean,
 ): void {
-  if (!isPlaying || charPool.length === 0 || opacity <= 0) return;
+  if (charPool.length === 0 || opacity <= 0) return;
 
   const charH = fontSize * 1.35;
   const poolLen = Math.max(1, charPool.length);
@@ -334,6 +336,9 @@ export const CanvasPreview = forwardRef<HTMLCanvasElement>(
     const prevBinaryFontSizeRef = useRef<number>(0);
     const prevAffirmFontSizeRef = useRef<number>(0);
     const lastFrameTimeRef = useRef<number>(0);
+    // Sequential char index counters — ensure drops fall in user-typed order
+    const binaryNextCharRef = useRef<{ value: number }>({ value: 0 });
+    const affirmNextCharRef = useRef<{ value: number }>({ value: 0 });
 
     // Stable refs for media elements
     const bgVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -368,6 +373,10 @@ export const CanvasPreview = forwardRef<HTMLCanvasElement>(
     const isPlaying = playback.isPlaying;
     const currentTime = playback.currentTime;
     const duration = playback.duration;
+
+    // Derive "has any media loaded" to decide if the RAF loop should run.
+    // We check background url + any pip url from the store directly.
+    const hasMedia = !!background.fileUrl || pips.some((p) => !!p.fileUrl);
 
     // ---- Load background media ----
     useEffect(() => {
@@ -595,7 +604,7 @@ export const CanvasPreview = forwardRef<HTMLCanvasElement>(
         }
 
         // ---- Binary Rain overlay (user) ----
-        if (binary.isPlaying && binary.binaryOutput && binary.opacity > 0) {
+        if (binary.binaryOutput && binary.opacity > 0) {
           const binFontSize = Math.max(8, binary.fontSize);
           const charPool = binary.binaryOutput.replace(/\s/g, "");
           const speedMult = binary.speed / 100;
@@ -607,6 +616,8 @@ export const CanvasPreview = forwardRef<HTMLCanvasElement>(
           ) {
             prevBinaryOutputRef.current = binary.binaryOutput;
             prevBinaryFontSizeRef.current = binFontSize;
+            // Reset sequential counter so order restarts with the new input
+            binaryNextCharRef.current.value = 0;
             binaryRainColsRef.current = initRainColumns(
               W,
               binFontSize,
@@ -614,7 +625,7 @@ export const CanvasPreview = forwardRef<HTMLCanvasElement>(
             );
           }
 
-          // Update rain physics
+          // Update rain physics — always runs when there's binary text
           updateRainColumns(
             binaryRainColsRef.current,
             dt,
@@ -622,7 +633,7 @@ export const CanvasPreview = forwardRef<HTMLCanvasElement>(
             binFontSize,
             charPool,
             speedMult,
-            binary.isPlaying,
+            binaryNextCharRef.current,
           );
 
           // Draw rain
@@ -633,7 +644,6 @@ export const CanvasPreview = forwardRef<HTMLCanvasElement>(
             binFontSize,
             binary.fgColor,
             binary.opacity / 100,
-            binary.isPlaying,
           );
         }
 
@@ -708,6 +718,8 @@ export const CanvasPreview = forwardRef<HTMLCanvasElement>(
             ) {
               prevAffirmTextRef.current = affirmations.text;
               prevAffirmFontSizeRef.current = affFontSize;
+              // Reset sequential counter so order restarts with the new text
+              affirmNextCharRef.current.value = 0;
               // Fewer columns for affirmations — wider spacing so text is legible
               const colW = Math.max(affFontSize * 1.2, 14);
               const numCols = Math.floor(W / colW);
@@ -727,7 +739,7 @@ export const CanvasPreview = forwardRef<HTMLCanvasElement>(
               affFontSize,
               charPool.join(""),
               speedMult,
-              affirmations.isPlaying,
+              affirmNextCharRef.current,
             );
 
             // Draw rain — affirmations use their color scheme
@@ -738,7 +750,6 @@ export const CanvasPreview = forwardRef<HTMLCanvasElement>(
               affFontSize,
               affirmations.fgColor,
               affirmations.opacity / 100,
-              affirmations.isPlaying,
             );
 
             // ---- Also show current affirmation word-stream at top (subtle) ----
@@ -777,8 +788,15 @@ export const CanvasPreview = forwardRef<HTMLCanvasElement>(
       [pips, affirmations, binary, staticLayer, isochronic],
     );
 
-    // ---- Continuous render loop (RAF, always running) ----
+    // ---- Canvas render loop — only runs when playing or media is loaded ----
+    // When idle with no media, no RAF loop runs, saving CPU/GPU entirely.
     useEffect(() => {
+      // Always draw at least one static frame so the canvas isn't blank.
+      renderFrame(performance.now());
+
+      // Only start the continuous loop if there's something to animate.
+      if (!isPlaying && !hasMedia) return;
+
       let frameId: number;
       const loop = (now: number) => {
         renderFrame(now);
@@ -786,7 +804,7 @@ export const CanvasPreview = forwardRef<HTMLCanvasElement>(
       };
       frameId = requestAnimationFrame(loop);
       return () => cancelAnimationFrame(frameId);
-    }, [renderFrame]);
+    }, [renderFrame, isPlaying, hasMedia]);
 
     // ---- Controls ----
     const handlePlay = () => {

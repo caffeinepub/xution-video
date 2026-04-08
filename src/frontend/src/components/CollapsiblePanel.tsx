@@ -18,6 +18,9 @@ export function CollapsiblePanel({
   titleExtra,
 }: CollapsiblePanelProps) {
   const [isOpen, setIsOpen] = useState(defaultOpen);
+  // Lazy-mount: only render children after the panel has been opened at least once.
+  // If defaultOpen is true, treat it as already opened so content renders immediately.
+  const [hasBeenOpened, setHasBeenOpened] = useState(defaultOpen);
 
   return (
     <div
@@ -29,7 +32,10 @@ export function CollapsiblePanel({
     >
       <button
         type="button"
-        onClick={() => setIsOpen((v) => !v)}
+        onClick={() => {
+          setIsOpen((v) => !v);
+          setHasBeenOpened(true);
+        }}
         className="w-full flex items-center justify-between px-3 py-2 bg-[#111] hover:bg-[#1a1a00] transition-colors duration-200 group"
         data-ocid="panel-toggle"
         aria-expanded={isOpen}
@@ -58,7 +64,9 @@ export function CollapsiblePanel({
           opacity: isOpen ? 1 : 0,
         }}
       >
-        <div className="border-t border-[#FFD700]/20 p-3">{children}</div>
+        <div className="border-t border-[#FFD700]/20 p-3">
+          {hasBeenOpened ? children : null}
+        </div>
       </div>
     </div>
   );
