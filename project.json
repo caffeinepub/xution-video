@@ -1,0 +1,31 @@
+{
+  "overview": "Xution Video is a powerful browser-based layered video composition tool with gold and black theming. It features a canvas preview with play/pause controls, background image/video layer, 4 picture-in-picture slots with crop/resize/position controls, 4 audio tracks, affirmations overlay with text-to-speech, binary code overlay with audio beeps, static noise effects, isochronic tone generator, and WAV/MP4 export.",
+  "features": [
+    "Canvas preview with play/pause/scrub controls",
+    "Background image/video upload with duration control",
+    "4 PiP layers with crop, resize, position, opacity, and timing",
+    "4 audio tracks with volume and auto-looping",
+    "Affirmations overlay with Web Speech API TTS",
+    "Binary code overlay with Morse-style audio beeps",
+    "Static noise visual and white noise audio",
+    "Isochronic tone generator (Alpha/Beta/Theta/Delta/Gamma)",
+    "WAV mixdown export",
+    "MP4 canvas render export",
+    "Collapsible panel layout",
+    "Gold #FFD700 and black monospace theme"
+  ],
+  "category": "media-video",
+  "tags": [
+    "video",
+    "audio",
+    "canvas",
+    "composition",
+    "editor",
+    "affirmations",
+    "binary",
+    "isochronic",
+    "export",
+    "gold-theme"
+  ],
+  "last_updated": "2026-04-08T00:30:32.951Z"
+}
