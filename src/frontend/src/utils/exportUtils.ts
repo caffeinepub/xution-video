@@ -150,7 +150,6 @@ async function buildOfflineAudio(state: AppState): Promise<AudioBuffer> {
           `[buildOfflineAudio] Audio layer ${layer.id} loaded — vol=${layer.volume}%`,
         );
       } catch (err) {
-        // Log but don't abort — other layers should still render
         console.warn(
           `[buildOfflineAudio] Failed to load audio layer ${layer.id}:`,
           err,
@@ -390,7 +389,6 @@ function updateRainColumnsExport(
       if (Math.random() < spawnProb + 0.7) {
         const speed = minSpeed + Math.random() * (maxSpeed - minSpeed);
         const length = minLen + Math.floor(Math.random() * (maxLen - minLen));
-        // Sequential charOffset: pick up exactly where the last drop left off
         const charOffset = nextCharIndexRef.value % poolLen;
         nextCharIndexRef.value = (nextCharIndexRef.value + length) % poolLen;
         col.drops.push({ y: -charH, speed, length, charOffset, flash: false });
@@ -719,564 +717,52 @@ function loadImage(url: string): Promise<HTMLImageElement> {
 }
 
 function loadVideo(url: string): Promise<HTMLVideoElement> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const vid = document.createElement("video");
     vid.crossOrigin = "anonymous";
     vid.muted = true;
     vid.playsInline = true;
     vid.preload = "auto";
     vid.oncanplaythrough = () => resolve(vid);
-    vid.onerror = reject;
+    vid.onerror = () => resolve(vid); // resolve anyway so export continues
     vid.src = url;
     vid.load();
     setTimeout(() => resolve(vid), 5000);
   });
 }
 
-// ─── Canvas blob capture helper ───────────────────────────────────────────────
+// ─── Detect best supported MediaRecorder mime type ───────────────────────────
 
-function captureFrameBlob(
-  canvas: HTMLCanvasElement,
-  mimeType: string,
-  quality: number,
-): Promise<Blob | null> {
-  return new Promise((resolve) => {
-    canvas.toBlob((blob) => resolve(blob), mimeType, quality);
-  });
-}
-
-// ─── Minimal pure-JS WebM muxer ───────────────────────────────────────────────
-
-function ebmlVInt(value: number): Uint8Array {
-  if (value < 0x7f) {
-    return new Uint8Array([value | 0x80]);
+function getBestMimeType(): string | null {
+  const candidates = [
+    "video/webm;codecs=vp9,opus",
+    "video/webm;codecs=vp8,opus",
+    "video/webm;codecs=vp9",
+    "video/webm;codecs=vp8",
+    "video/webm",
+  ];
+  for (const mime of candidates) {
+    if (MediaRecorder.isTypeSupported(mime)) return mime;
   }
-  if (value < 0x3fff) {
-    return new Uint8Array([(value >> 8) | 0x40, value & 0xff]);
-  }
-  if (value < 0x1fffff) {
-    return new Uint8Array([
-      (value >> 16) | 0x20,
-      (value >> 8) & 0xff,
-      value & 0xff,
-    ]);
-  }
-  if (value < 0x0fffffff) {
-    return new Uint8Array([
-      (value >> 24) | 0x10,
-      (value >> 16) & 0xff,
-      (value >> 8) & 0xff,
-      value & 0xff,
-    ]);
-  }
-  return new Uint8Array([0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-}
-
-function ebmlUInt(value: number): Uint8Array {
-  if (value === 0) return new Uint8Array([0]);
-  const bytes: number[] = [];
-  let v = value;
-  while (v > 0) {
-    bytes.unshift(v & 0xff);
-    v = Math.floor(v / 256);
-  }
-  return new Uint8Array(bytes);
-}
-
-function ebmlFloat64(value: number): Uint8Array {
-  const buf = new ArrayBuffer(8);
-  new DataView(buf).setFloat64(0, value, false);
-  return new Uint8Array(buf);
-}
-
-function ebmlString(str: string): Uint8Array {
-  return new TextEncoder().encode(str);
-}
-
-function concat(...arrays: Uint8Array[]): Uint8Array {
-  const total = arrays.reduce((s, a) => s + a.length, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const a of arrays) {
-    out.set(a, offset);
-    offset += a.length;
-  }
-  return out;
-}
-
-function ebmlElem(idHex: number[], data: Uint8Array): Uint8Array {
-  const id = new Uint8Array(idHex);
-  const size = ebmlVInt(data.length);
-  return concat(id, size, data);
-}
-
-function buildEbmlHeader(): Uint8Array {
-  const ebmlVersion = ebmlElem([0x42, 0x86], ebmlUInt(1));
-  const ebmlReadVersion = ebmlElem([0x42, 0xf7], ebmlUInt(1));
-  const ebmlMaxIdLength = ebmlElem([0x42, 0xf2], ebmlUInt(4));
-  const ebmlMaxSizeLength = ebmlElem([0x42, 0xf3], ebmlUInt(8));
-  const docType = ebmlElem([0x42, 0x82], ebmlString("webm"));
-  const docTypeVersion = ebmlElem([0x42, 0x87], ebmlUInt(4));
-  const docTypeReadVersion = ebmlElem([0x42, 0x85], ebmlUInt(2));
-  const inner = concat(
-    ebmlVersion,
-    ebmlReadVersion,
-    ebmlMaxIdLength,
-    ebmlMaxSizeLength,
-    docType,
-    docTypeVersion,
-    docTypeReadVersion,
-  );
-  return ebmlElem([0x1a, 0x45, 0xdf, 0xa3], inner);
-}
-
-function buildSegmentInfo(durationMs: number): Uint8Array {
-  const timecodeScale = ebmlElem([0x2a, 0xd7, 0xb1], ebmlUInt(1_000_000));
-  const segDuration = ebmlElem([0x44, 0x89], ebmlFloat64(durationMs));
-  const muxingApp = ebmlElem([0x4d, 0x80], ebmlString("xution-video-muxer"));
-  const writingApp = ebmlElem([0x57, 0x41], ebmlString("xution-video-muxer"));
-  const inner = concat(timecodeScale, segDuration, muxingApp, writingApp);
-  return ebmlElem([0x15, 0x49, 0xa9, 0x66], inner);
-}
-
-// Build Tracks for video-only or video+audio (PCM Int16)
-function buildTracks(
-  width: number,
-  height: number,
-  frameRateNum: number,
-  frameRateDen: number,
-  audioSampleRate?: number,
-  audioChannels?: number,
-): Uint8Array {
-  const frameRateFloat = frameRateNum / frameRateDen;
-
-  // Video track entry — V_MJPEG because we store JPEG/WebP image frames
-  const pixelWidth = ebmlElem([0xb0], ebmlUInt(width));
-  const pixelHeight = ebmlElem([0xba], ebmlUInt(height));
-  const frameRate = ebmlElem([0x23, 0x83, 0xe3], ebmlFloat64(frameRateFloat));
-  const videoInner = concat(pixelWidth, pixelHeight, frameRate);
-  const videoElem = ebmlElem([0xe0], videoInner);
-
-  const videoTrackEntry = concat(
-    ebmlElem([0xd7], ebmlUInt(1)), // TrackNumber
-    ebmlElem([0x73, 0xc5], ebmlUInt(1)), // TrackUID
-    ebmlElem([0x83], ebmlUInt(1)), // TrackType: video
-    ebmlElem([0xb9], ebmlUInt(1)), // FlagEnabled
-    ebmlElem([0x88], ebmlUInt(1)), // FlagDefault
-    ebmlElem(
-      [0x23, 0xe3, 0x83],
-      ebmlUInt(Math.round(1_000_000_000 / frameRateFloat)),
-    ), // DefaultDuration (ns)
-    ebmlElem([0x86], ebmlString("V_MJPEG")), // CodecID: Motion JPEG (our frames are JPEG/WebP)
-    videoElem,
-  );
-  const videoTrackElem = ebmlElem([0xae], videoTrackEntry);
-
-  if (!audioSampleRate || !audioChannels) {
-    return ebmlElem([0x16, 0x54, 0xae, 0x6b], videoTrackElem);
-  }
-
-  // Audio track entry — PCM Int16 little-endian (most universally compatible)
-  const samplingFreq = ebmlElem([0xb5], ebmlFloat64(audioSampleRate));
-  const channels = ebmlElem([0x9f], ebmlUInt(audioChannels));
-  const bitDepth = ebmlElem([0x62, 0x64], ebmlUInt(16)); // 16-bit Int
-  const audioElem = ebmlElem([0xe1], concat(samplingFreq, channels, bitDepth));
-
-  const audioTrackEntry = concat(
-    ebmlElem([0xd7], ebmlUInt(2)), // TrackNumber
-    ebmlElem([0x73, 0xc5], ebmlUInt(2)), // TrackUID
-    ebmlElem([0x83], ebmlUInt(2)), // TrackType: audio
-    ebmlElem([0xb9], ebmlUInt(1)), // FlagEnabled
-    ebmlElem([0x88], ebmlUInt(1)), // FlagDefault
-    ebmlElem([0x86], ebmlString("A_PCM/INT/LIT")), // CodecID: PCM Int16 LE — universally supported
-    audioElem,
-  );
-  const audioTrackElem = ebmlElem([0xae], audioTrackEntry);
-
-  return ebmlElem(
-    [0x16, 0x54, 0xae, 0x6b],
-    concat(videoTrackElem, audioTrackElem),
-  );
-}
-
-// Build a cluster containing SimpleBlocks for one or both tracks
-function buildCluster(
-  timecodeMs: number,
-  frames: Array<{
-    offsetMs: number;
-    trackNum: number;
-    data: Uint8Array;
-    isKeyframe?: boolean;
-  }>,
-): Uint8Array {
-  const timecode = ebmlElem([0xe7], ebmlUInt(timecodeMs));
-  const blocks: Uint8Array[] = [timecode];
-
-  for (const frame of frames) {
-    const relTimecode = Math.max(0, frame.offsetMs);
-    const trackVInt = ebmlVInt(frame.trackNum);
-    const tcBytes = new Uint8Array(2);
-    new DataView(tcBytes.buffer).setInt16(0, relTimecode & 0x7fff, false);
-    const flags = new Uint8Array([frame.isKeyframe !== false ? 0x80 : 0x00]);
-    const simpleBlockData = concat(trackVInt, tcBytes, flags, frame.data);
-    const simpleBlock = ebmlElem([0xa3], simpleBlockData);
-    blocks.push(simpleBlock);
-  }
-
-  const inner = concat(...blocks);
-  return ebmlElem([0x1f, 0x43, 0xb6, 0x75], inner);
-}
-
-interface WebMFrame {
-  timecodeMs: number;
-  data: Uint8Array;
-  trackNum?: number;
-  isKeyframe?: boolean;
-}
-
-function buildWebM(
-  width: number,
-  height: number,
-  fps: number,
-  frames: WebMFrame[],
-  audioFrames?: WebMFrame[],
-  audioSampleRate?: number,
-  audioChannels?: number,
-): Blob {
-  const videoFrames = frames;
-  const lastVideoMs =
-    videoFrames.length > 0
-      ? videoFrames[videoFrames.length - 1].timecodeMs + Math.round(1000 / fps)
-      : 0;
-  const lastAudioMs =
-    audioFrames && audioFrames.length > 0
-      ? audioFrames[audioFrames.length - 1].timecodeMs + 20
-      : 0;
-  const durationMs = Math.max(lastVideoMs, lastAudioMs);
-
-  const ebmlHeader = buildEbmlHeader();
-  const segInfo = buildSegmentInfo(durationMs);
-  const tracks = buildTracks(
-    width,
-    height,
-    fps,
-    1,
-    audioFrames && audioFrames.length > 0 ? audioSampleRate : undefined,
-    audioFrames && audioFrames.length > 0 ? audioChannels : undefined,
-  );
-
-  // Interleave video and audio frames into clusters of ~1 second
-  const CLUSTER_DURATION_MS = 1000;
-  const clusters: Uint8Array[] = [];
-
-  type MuxFrame = {
-    timecodeMs: number;
-    trackNum: number;
-    data: Uint8Array;
-    isKeyframe?: boolean;
-  };
-  const allFrames: MuxFrame[] = [
-    ...videoFrames.map((f) => ({
-      timecodeMs: f.timecodeMs,
-      trackNum: 1,
-      data: f.data,
-      isKeyframe: true,
-    })),
-    ...(audioFrames ?? []).map((f) => ({
-      timecodeMs: f.timecodeMs,
-      trackNum: 2,
-      data: f.data,
-      isKeyframe: f.isKeyframe !== false,
-    })),
-  ].sort((a, b) => a.timecodeMs - b.timecodeMs || a.trackNum - b.trackNum);
-
-  let clusterStart = 0;
-  let clusterFrames: Array<{
-    offsetMs: number;
-    trackNum: number;
-    data: Uint8Array;
-    isKeyframe?: boolean;
-  }> = [];
-
-  for (const frame of allFrames) {
-    if (
-      frame.timecodeMs >= clusterStart + CLUSTER_DURATION_MS &&
-      clusterFrames.length > 0
-    ) {
-      clusters.push(buildCluster(clusterStart, clusterFrames));
-      clusterStart = frame.timecodeMs;
-      clusterFrames = [];
-    }
-    clusterFrames.push({
-      offsetMs: frame.timecodeMs - clusterStart,
-      trackNum: frame.trackNum,
-      data: frame.data,
-      isKeyframe: frame.isKeyframe,
-    });
-  }
-  if (clusterFrames.length > 0) {
-    clusters.push(buildCluster(clusterStart, clusterFrames));
-  }
-
-  const segBody = concat(segInfo, tracks, ...clusters);
-  const segId = new Uint8Array([0x18, 0x53, 0x80, 0x67]);
-  const segSize = new Uint8Array([
-    0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-  ]);
-  const segment = concat(segId, segSize, segBody);
-
-  return new Blob(
-    [ebmlHeader.buffer as ArrayBuffer, segment.buffer as ArrayBuffer],
-    { type: "video/webm" },
-  );
-}
-
-// ─── Convert AudioBuffer to interleaved PCM Int16 WebM audio frames ──────────
-//
-// Splits the rendered AudioBuffer into ~100ms PCM chunks encoded as Int16 LE,
-// one WebMFrame per chunk. This is muxed as A_PCM/INT/LIT which is the most
-// universally compatible raw PCM format for WebM containers.
-
-function audioBufferToPcmFrames(
-  buffer: AudioBuffer,
-  chunkDurationSec = 0.1,
-): WebMFrame[] {
-  const sampleRate = buffer.sampleRate;
-  const numChannels = buffer.numberOfChannels;
-  const totalSamples = buffer.length;
-  const samplesPerChunk = Math.ceil(sampleRate * chunkDurationSec);
-  const frames: WebMFrame[] = [];
-
-  for (
-    let startSample = 0;
-    startSample < totalSamples;
-    startSample += samplesPerChunk
-  ) {
-    const endSample = Math.min(startSample + samplesPerChunk, totalSamples);
-    const chunkSamples = endSample - startSample;
-    // Interleaved Int16 little-endian: L0 R0 L1 R1 ...
-    const pcmData = new Int16Array(chunkSamples * numChannels);
-    for (let i = 0; i < chunkSamples; i++) {
-      for (let ch = 0; ch < numChannels; ch++) {
-        const f = Math.max(
-          -1,
-          Math.min(1, buffer.getChannelData(ch)[startSample + i]),
-        );
-        // Convert float32 [-1..1] to int16 [-32768..32767]
-        pcmData[i * numChannels + ch] =
-          f < 0 ? Math.round(f * 32768) : Math.round(f * 32767);
-      }
-    }
-    const timecodeMs = Math.round((startSample / sampleRate) * 1000);
-    frames.push({
-      timecodeMs,
-      data: new Uint8Array(pcmData.buffer),
-      trackNum: 2,
-      isKeyframe: true,
-    });
-  }
-
-  return frames;
-}
-
-// ─── Primary: MediaRecorder with pre-rendered audio via BufferSourceNode ──────
-//
-// NOTE: MediaRecorder is unreliable on mobile Chrome for canvas capture with
-// audio. This function is kept for desktop Chrome but falls back gracefully.
-// The primary path for mobile is the frame-by-frame WebM muxer in exportMP4.
-
-async function tryMediaRecorderExport(
-  state: AppState,
-  liveCanvas: HTMLCanvasElement,
-  onProgress: ExportProgressCallback,
-): Promise<Blob | null> {
-  // Skip MediaRecorder on mobile — it consistently fails to capture canvas frames
-  const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-  if (isMobile) {
-    console.log(
-      "[exportVideo] Mobile detected — skipping MediaRecorder, using frame-by-frame muxer",
-    );
-    return null;
-  }
-
-  const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus")
-    ? "video/webm;codecs=vp8,opus"
-    : MediaRecorder.isTypeSupported("video/webm;codecs=vp8")
-      ? "video/webm;codecs=vp8"
-      : MediaRecorder.isTypeSupported("video/webm")
-        ? "video/webm"
-        : null;
-
-  if (!mimeType) {
-    console.log(
-      "[exportVideo] MediaRecorder does not support webm — using fallback",
-    );
-    return null;
-  }
-
-  console.log(`[exportVideo] Trying MediaRecorder with mimeType=${mimeType}`);
-
-  const duration = state.background.duration;
-  const fps = duration > 300 ? 15 : duration > 60 ? 20 : 24;
-
-  const hasAudio =
-    state.audios.some((a) => a.isActive && a.fileUrl) ||
-    state.staticLayer.isActive ||
-    (state.isochronic.isActive && state.isochronic.presets.length > 0);
-
-  // Step 1: render audio offline — this is deterministic and always works
-  let audioCtx: AudioContext | null = null;
-  let audioDestination: MediaStreamAudioDestinationNode | null = null;
-  let audioBufferSource: AudioBufferSourceNode | null = null;
-
-  if (hasAudio) {
-    onProgress(3, 0);
-    console.log("[exportVideo] Rendering audio offline before recording...");
-    try {
-      const renderedBuffer = await buildOfflineAudio(state);
-      // Resume or create AudioContext — must happen from user gesture context
-      audioCtx = new AudioContext({ sampleRate: renderedBuffer.sampleRate });
-      if (audioCtx.state === "suspended") {
-        await audioCtx.resume();
-      }
-      audioDestination = audioCtx.createMediaStreamDestination();
-      audioBufferSource = audioCtx.createBufferSource();
-      audioBufferSource.buffer = renderedBuffer;
-      audioBufferSource.connect(audioDestination);
-      console.log(
-        `[exportVideo] Offline render ready — ${renderedBuffer.duration.toFixed(1)}s`,
-      );
-    } catch (e) {
-      console.warn("[exportVideo] Offline audio render failed:", e);
-      audioCtx = null;
-      audioDestination = null;
-      audioBufferSource = null;
-    }
-  }
-
-  return new Promise<Blob | null>((resolve) => {
-    // Combine canvas video stream + pre-rendered audio stream
-    const videoStream = liveCanvas.captureStream(fps);
-    let combinedStream: MediaStream;
-
-    if (audioDestination) {
-      combinedStream = new MediaStream([
-        ...videoStream.getVideoTracks(),
-        ...audioDestination.stream.getAudioTracks(),
-      ]);
-      console.log(
-        "[exportVideo] Combined canvas video + pre-rendered audio stream",
-      );
-    } else {
-      combinedStream = videoStream;
-      console.log("[exportVideo] No audio — recording video only");
-    }
-
-    let recorder: MediaRecorder;
-    try {
-      recorder = new MediaRecorder(combinedStream, { mimeType });
-    } catch {
-      console.warn("[exportVideo] MediaRecorder constructor failed");
-      audioCtx?.close();
-      resolve(null);
-      return;
-    }
-
-    const chunks: Blob[] = [];
-    let gotData = false;
-    const startTime = Date.now();
-
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) {
-        chunks.push(e.data);
-        gotData = true;
-      }
-    };
-
-    recorder.onstop = () => {
-      try {
-        audioBufferSource?.stop();
-      } catch {}
-      setTimeout(() => {
-        try {
-          audioCtx?.close();
-        } catch {}
-      }, 500);
-
-      if (!gotData || chunks.length === 0) {
-        console.warn("[exportVideo] MediaRecorder produced no data");
-        resolve(null);
-        return;
-      }
-      const blob = new Blob(chunks, { type: "video/webm" });
-      console.log(
-        `[exportVideo] MediaRecorder success — size=${(blob.size / 1024 / 1024).toFixed(1)}MB`,
-      );
-      resolve(blob);
-    };
-
-    recorder.onerror = () => {
-      try {
-        audioBufferSource?.stop();
-      } catch {}
-      audioCtx?.close();
-      console.warn("[exportVideo] MediaRecorder error");
-      resolve(null);
-    };
-
-    // Start audio source node at the exact same time as recorder
-    // This ensures perfect sync: audio plays from t=0 as recording begins
-    audioBufferSource?.start(0);
-    recorder.start(200);
-
-    const totalMs = duration * 1000;
-    let rafId = 0;
-
-    const tick = () => {
-      const elapsed = Date.now() - startTime;
-      const percent = Math.min(95, 5 + Math.round((elapsed / totalMs) * 90));
-      onProgress(percent, elapsed / 1000);
-
-      if (elapsed < totalMs) {
-        rafId = requestAnimationFrame(tick);
-      } else {
-        cancelAnimationFrame(rafId);
-        setTimeout(() => {
-          recorder.requestData();
-          setTimeout(() => recorder.stop(), 500);
-        }, 300);
-      }
-    };
-
-    rafId = requestAnimationFrame(tick);
-
-    // Safety timeout: if no data after 8s, give up
-    setTimeout(() => {
-      if (!gotData && recorder.state !== "inactive") {
-        console.warn(
-          "[exportVideo] MediaRecorder timed out with no data — aborting",
-        );
-        cancelAnimationFrame(rafId);
-        try {
-          audioBufferSource?.stop();
-        } catch {}
-        recorder.stop();
-        resolve(null);
-      }
-    }, 8000);
-  });
+  return null;
 }
 
 // ─── Public: exportMP4 ────────────────────────────────────────────────────────
 //
 // Strategy:
-//   1. Pre-render audio offline to AudioBuffer (deterministic, always includes
-//      uploaded files + static noise + isochronic tones).
-//   2. On mobile: skip MediaRecorder (unreliable), go straight to frame-by-frame
-//      WebM muxer with Int16 PCM audio track (A_PCM/INT/LIT). Video frames are
-//      stored as V_MJPEG (JPEG/WebP images per frame).
-//   3. On desktop: try MediaRecorder with canvas stream + BufferSourceNode audio.
-//      If it produces no data, fall back to the same frame-by-frame muxer.
+//   1. Pre-render all audio to an AudioBuffer via OfflineAudioContext.
+//   2. Create an OFFSCREEN canvas (same size as live canvas) — MediaRecorder
+//      only reliably captures the canvas it was set up with. Using offscreen
+//      avoids interfering with the live preview canvas.
+//   3. Feed canvas.captureStream() + AudioContext→BufferSource→MediaStreamDest
+//      as a single combined MediaStream into MediaRecorder.
+//   4. Run a setInterval render loop that draws each frame onto the offscreen
+//      canvas at the target fps for totalDuration seconds.
+//   5. Stop MediaRecorder → collect chunks → download as .webm.
+//
+// This path works on desktop Chrome, Firefox, and Safari (where MediaRecorder
+// supports canvas capture). Mobile Chrome is unreliable for canvas capture
+// and gets a clear error message rather than a broken file.
 
 export async function exportMP4(
   state: AppState,
@@ -1296,66 +782,52 @@ export async function exportMP4(
   const H = liveCanvas.height || 720;
   const duration = state.background.duration;
 
-  // ── Step 1: Try MediaRecorder with pre-rendered audio ───────────────────────
-  const mrBlob = await tryMediaRecorderExport(
-    state,
-    liveCanvas,
-    (pct, elapsed) => {
-      progress(pct, elapsed);
-    },
-  );
-
-  if (mrBlob && mrBlob.size > 10_000) {
-    progress(100, duration);
-    triggerDownload(mrBlob, "xution-video-export.webm", (err) => {
-      progress(100, duration, err);
-    });
-    return;
+  if (duration <= 0) {
+    throw new Error(
+      "Duration must be greater than 0. Set a background duration first.",
+    );
   }
 
-  // ── Step 2: Pure-JS WebM muxer with PCM audio ──────────────────────────────
+  // Check MediaRecorder support
+  const mimeType = getBestMimeType();
+  if (!mimeType) {
+    throw new Error(
+      "Your browser does not support WebM video recording. " +
+        "Please use Chrome, Firefox, or Edge on desktop.",
+    );
+  }
+
   console.log(
-    "[exportVideo] Falling back to frame-by-frame WebM muxer with PCM audio",
+    `[exportVideo] Starting export — ${W}x${H}, ${duration}s, mimeType=${mimeType}`,
   );
+  progress(2, 0);
 
-  const fps = duration > 300 ? 15 : duration > 60 ? 20 : 24;
-  const totalFrames = Math.ceil(duration * fps);
-  const startRealTime = Date.now();
-
-  console.log(
-    `[exportVideo] Frame-by-frame WebM — ${W}x${H}, ${fps}fps, ${totalFrames} frames`,
-  );
-
-  // Pre-render audio to buffer now (before frame loop) so it's ready to mux
-  let renderedAudioBuffer: AudioBuffer | null = null;
+  // ── Step 1: Pre-render all audio offline ────────────────────────────────────
   const hasAudio =
     state.audios.some((a) => a.isActive && a.fileUrl) ||
     state.staticLayer.isActive ||
     (state.isochronic.isActive && state.isochronic.presets.length > 0);
 
+  let renderedAudioBuffer: AudioBuffer | null = null;
   if (hasAudio) {
+    console.log("[exportVideo] Pre-rendering audio offline...");
     progress(5, 0);
-    console.log("[exportVideo] Pre-rendering audio for fallback muxer...");
     try {
       renderedAudioBuffer = await buildOfflineAudio(state);
       console.log(
-        `[exportVideo] Audio pre-render done — ${renderedAudioBuffer.duration.toFixed(1)}s`,
+        `[exportVideo] Audio ready — ${renderedAudioBuffer.duration.toFixed(1)}s`,
       );
     } catch (e) {
-      console.warn("[exportVideo] Audio pre-render failed:", e);
+      console.warn(
+        "[exportVideo] Audio pre-render failed (continuing without audio):",
+        e,
+      );
     }
   }
 
-  // Create offscreen canvas for rendering
-  const offscreen = document.createElement("canvas");
-  offscreen.width = W;
-  offscreen.height = H;
-  const ctx = offscreen.getContext("2d", { willReadFrequently: true });
-  if (!ctx) {
-    throw new Error("Could not get 2D context for export canvas.");
-  }
+  progress(10, 0);
 
-  // Load background media
+  // ── Step 2: Load all media elements ─────────────────────────────────────────
   let bgEl: HTMLVideoElement | HTMLImageElement | null = null;
   if (state.background.fileUrl) {
     try {
@@ -1370,7 +842,6 @@ export async function exportMP4(
     }
   }
 
-  // Load PiP media elements
   const pipEls: Array<HTMLVideoElement | HTMLImageElement | null> = [
     null,
     null,
@@ -1393,16 +864,90 @@ export async function exportMP4(
     }),
   );
 
-  const supportsWebP = offscreen
-    .toDataURL("image/webp")
-    .startsWith("data:image/webp");
-  const captureType = supportsWebP ? "image/webp" : "image/jpeg";
-  const captureQuality = 0.85;
-  console.log(`[exportVideo] Frame capture format: ${captureType}`);
+  progress(15, 0);
 
-  const webmFrames: WebMFrame[] = [];
-  const frameDt = 1 / fps;
+  // ── Step 3: Create offscreen canvas for export rendering ────────────────────
+  // Using a fresh offscreen canvas means MediaRecorder captures only export
+  // frames, not whatever the live preview might be doing.
+  const offscreen = document.createElement("canvas");
+  offscreen.width = W;
+  offscreen.height = H;
+  const ctx = offscreen.getContext("2d");
+  if (!ctx) {
+    throw new Error("Could not get 2D context for export canvas.");
+  }
 
+  // Draw first frame immediately so the stream has content before recorder starts
+  ctx.fillStyle = "#000000";
+  ctx.fillRect(0, 0, W, H);
+
+  // ── Step 4: Set up audio stream from pre-rendered buffer ─────────────────────
+  let audioCtx: AudioContext | null = null;
+  let audioDestination: MediaStreamAudioDestinationNode | null = null;
+  let audioSource: AudioBufferSourceNode | null = null;
+
+  if (renderedAudioBuffer) {
+    try {
+      // Use the same sample rate as the pre-rendered buffer to avoid codec mismatch
+      audioCtx = new AudioContext({
+        sampleRate: renderedAudioBuffer.sampleRate,
+      });
+      // Ensure context is running before creating nodes (browser autoplay policy)
+      if (audioCtx.state === "suspended") await audioCtx.resume();
+      audioDestination = audioCtx.createMediaStreamDestination();
+      audioSource = audioCtx.createBufferSource();
+      audioSource.buffer = renderedAudioBuffer;
+      audioSource.connect(audioDestination);
+
+      // *** FIX: Start audio source BEFORE the recorder so frames are flowing
+      // when recording begins. The source must be playing into the destination
+      // stream before MediaRecorder.start() is called, otherwise the audio
+      // track delivers zero frames and the export is silent.
+      audioSource.start(0);
+      console.log(
+        `[exportVideo] Audio source started — sampleRate=${renderedAudioBuffer.sampleRate}Hz, duration=${renderedAudioBuffer.duration.toFixed(1)}s`,
+      );
+
+      // Give the audio stream 150ms to buffer frames before we check track state
+      await new Promise<void>((res) => setTimeout(res, 150));
+
+      const audioTracks = audioDestination.stream.getAudioTracks();
+      console.log(
+        `[exportVideo] Audio destination tracks: ${audioTracks.length} — states: ${audioTracks.map((t) => t.readyState).join(", ")}`,
+      );
+      if (audioTracks.length === 0) {
+        console.warn(
+          "[exportVideo] No audio tracks on destination stream — export will be silent",
+        );
+      }
+    } catch (e) {
+      console.warn("[exportVideo] Audio context setup failed:", e);
+      audioCtx = null;
+      audioDestination = null;
+      audioSource = null;
+    }
+  }
+
+  // ── Step 5: Create combined MediaStream (canvas video + audio) ───────────────
+  const fps = duration > 300 ? 15 : duration > 60 ? 20 : 24;
+  const videoStream = offscreen.captureStream(fps);
+
+  let combinedStream: MediaStream;
+  const audioTracks = audioDestination?.stream.getAudioTracks() ?? [];
+  if (audioTracks.length > 0) {
+    combinedStream = new MediaStream([
+      ...videoStream.getVideoTracks(),
+      ...audioTracks,
+    ]);
+    console.log(
+      `[exportVideo] Combined video+audio stream ready — ${audioTracks.length} audio track(s)`,
+    );
+  } else {
+    combinedStream = videoStream;
+    console.log("[exportVideo] Video-only stream (no audio tracks available)");
+  }
+
+  // ── Step 6: Init rain columns for binary overlay ─────────────────────────────
   const exportBinaryRainCols: RainColumn[] =
     state.binary.binaryOutput && state.binary.opacity > 0
       ? initRainColumns(
@@ -1413,100 +958,168 @@ export async function exportMP4(
       : [];
   const exportBinaryNextCharRef = { value: 0 };
 
-  // Frame rendering loop — audio is pre-rendered so no parallel capture needed
-  for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
-    const t = frameIdx / fps;
-    const timecodeMs = Math.round(t * 1000);
-
-    if (bgEl instanceof HTMLVideoElement) {
-      const vidDur = bgEl.duration || duration;
-      bgEl.currentTime = t % vidDur;
-      if (frameIdx === 0) {
-        await new Promise<void>((r) => setTimeout(r, 100));
-      }
-    }
-    for (const el of pipEls) {
-      if (el instanceof HTMLVideoElement) {
-        const vidDur = el.duration || duration;
-        el.currentTime = t % vidDur;
-      }
-    }
-
-    renderExportFrame(
-      ctx,
-      W,
-      H,
-      t,
-      state,
-      bgEl,
-      pipEls,
-      frameDt,
-      exportBinaryRainCols,
-      exportBinaryNextCharRef,
-    );
-
-    const blob = await captureFrameBlob(offscreen, captureType, captureQuality);
-    if (blob) {
-      const arrayBuffer = await blob.arrayBuffer();
-      webmFrames.push({ timecodeMs, data: new Uint8Array(arrayBuffer) });
-    }
-
-    // Progress: 10–85% for video frames
-    const percent = 10 + Math.round(((frameIdx + 1) / totalFrames) * 75);
-    const elapsed = (Date.now() - startRealTime) / 1000;
-    progress(percent, elapsed);
-
-    if (frameIdx % 10 === 0) {
-      await new Promise<void>((r) => setTimeout(r, 0));
-    }
-  }
-
-  progress(85, (Date.now() - startRealTime) / 1000);
-  console.log("[exportVideo] All frames captured. Converting audio to PCM...");
-
-  // Convert the pre-rendered AudioBuffer to PCM WebM frames — no codec needed
-  let audioWebMFrames: WebMFrame[] | undefined;
-  let audioSampleRate: number | undefined;
-  let audioChannels: number | undefined;
-
-  if (renderedAudioBuffer) {
+  // ── Step 7: Start MediaRecorder and render loop ──────────────────────────────
+  return new Promise<void>((resolve, reject) => {
+    let recorder: MediaRecorder;
     try {
-      audioWebMFrames = audioBufferToPcmFrames(renderedAudioBuffer, 0.1);
-      audioSampleRate = renderedAudioBuffer.sampleRate;
-      audioChannels = renderedAudioBuffer.numberOfChannels;
-      console.log(
-        `[exportVideo] PCM audio frames: ${audioWebMFrames.length} chunks @ ${audioSampleRate}Hz`,
-      );
+      recorder = new MediaRecorder(combinedStream, {
+        mimeType,
+        videoBitsPerSecond: W >= 1280 ? 4_000_000 : 2_000_000,
+      });
     } catch (e) {
-      console.warn("[exportVideo] PCM audio frame conversion failed:", e);
-      audioWebMFrames = undefined;
+      audioCtx?.close();
+      reject(
+        new Error(
+          `MediaRecorder failed to start: ${e instanceof Error ? e.message : String(e)}. Try Chrome, Firefox, or Edge on desktop.`,
+        ),
+      );
+      return;
     }
-  }
 
-  progress(90, (Date.now() - startRealTime) / 1000);
-  console.log("[exportVideo] Assembling WebM container...");
+    const chunks: Blob[] = [];
+    let gotData = false;
+    const startWallTime = Date.now();
+    let frameTick: ReturnType<typeof setInterval> | null = null;
+    let currentTime = 0;
+    const frameDt = 1 / fps;
 
-  const videoBlob =
-    audioWebMFrames && audioWebMFrames.length > 0
-      ? buildWebM(
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) {
+        chunks.push(e.data);
+        gotData = true;
+      }
+    };
+
+    recorder.onstop = () => {
+      if (frameTick !== null) clearInterval(frameTick);
+
+      // Stop audio source
+      try {
+        audioSource?.stop();
+      } catch {}
+      setTimeout(() => {
+        try {
+          audioCtx?.close();
+        } catch {}
+      }, 500);
+
+      if (!gotData || chunks.length === 0) {
+        const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(
+          navigator.userAgent,
+        );
+        const errMsg = isMobile
+          ? "Video capture failed on mobile. Mobile Chrome does not reliably support canvas recording. " +
+            "Please try on desktop Chrome, Firefox, or Edge for best results."
+          : "No video data was captured. This can happen if the browser blocked canvas recording. " +
+            "Try refreshing the page and exporting again, or try a different browser.";
+        progress(100, duration, errMsg);
+        reject(new Error(errMsg));
+        return;
+      }
+
+      progress(98, duration);
+      const blob = new Blob(chunks, { type: "video/webm" });
+      console.log(
+        `[exportVideo] Export complete — ${(blob.size / 1024 / 1024).toFixed(1)}MB, ${chunks.length} chunks`,
+      );
+
+      progress(100, duration);
+      triggerDownload(blob, "xution-video-export.webm", (err) => {
+        progress(100, duration, err);
+      });
+      resolve();
+    };
+
+    recorder.onerror = (e) => {
+      if (frameTick !== null) clearInterval(frameTick);
+      try {
+        audioSource?.stop();
+      } catch {}
+      audioCtx?.close();
+      const msg =
+        (e as ErrorEvent).message ?? "MediaRecorder encountered an error";
+      console.error("[exportVideo] MediaRecorder error:", msg);
+      reject(new Error(`Export error: ${msg}`));
+    };
+
+    // Audio source was already started before recorder setup (see Step 4).
+    // Give the stream one final 100ms settle before recording begins so the
+    // encoder's first keyframe lands on a frame with live audio data.
+    setTimeout(() => {
+      recorder.start(500); // collect chunks every 500ms
+    }, 100);
+
+    // Render loop: draw frames onto the offscreen canvas at target fps
+    // setInterval is used (not rAF) so it runs even when tab is backgrounded
+    frameTick = setInterval(
+      () => {
+        if (currentTime > duration) {
+          // All frames rendered — request final data chunk and stop
+          clearInterval(frameTick!);
+          frameTick = null;
+          try {
+            audioSource?.stop();
+          } catch {}
+          setTimeout(() => {
+            recorder.requestData();
+            setTimeout(() => {
+              if (recorder.state !== "inactive") recorder.stop();
+            }, 600);
+          }, 200);
+          return;
+        }
+
+        // Update video element current times
+        const t = currentTime;
+        if (bgEl instanceof HTMLVideoElement) {
+          const vidDur = bgEl.duration || duration;
+          bgEl.currentTime = t % Math.max(0.001, vidDur);
+        }
+        for (const el of pipEls) {
+          if (el instanceof HTMLVideoElement) {
+            const vidDur = el.duration || duration;
+            el.currentTime = t % Math.max(0.001, vidDur);
+          }
+        }
+
+        // Draw this frame
+        renderExportFrame(
+          ctx,
           W,
           H,
-          fps,
-          webmFrames,
-          audioWebMFrames,
-          audioSampleRate,
-          audioChannels,
-        )
-      : buildWebM(W, H, fps, webmFrames);
+          t,
+          state,
+          bgEl,
+          pipEls,
+          frameDt,
+          exportBinaryRainCols,
+          exportBinaryNextCharRef,
+        );
 
-  console.log(
-    `[exportVideo] WebM assembled — size=${(videoBlob.size / 1024 / 1024).toFixed(1)}MB, audio=${audioWebMFrames?.length ?? 0} PCM chunks`,
-  );
+        currentTime += frameDt;
 
-  progress(100, (Date.now() - startRealTime) / 1000);
+        // Update progress (15% → 95% during render)
+        const renderProgress = Math.min(1, currentTime / duration);
+        const pct = 15 + Math.round(renderProgress * 80);
+        const elapsed = (Date.now() - startWallTime) / 1000;
+        progress(pct, elapsed);
+      },
+      Math.round(1000 / fps),
+    );
 
-  triggerDownload(videoBlob, "xution-video-export.webm", (err) => {
-    progress(100, (Date.now() - startRealTime) / 1000, err);
+    // Safety timeout: if no data after 10s of recording, abort
+    setTimeout(() => {
+      if (!gotData && recorder.state !== "inactive") {
+        console.warn("[exportVideo] Timed out waiting for data — aborting");
+        clearInterval(frameTick!);
+        frameTick = null;
+        try {
+          audioSource?.stop();
+        } catch {}
+        recorder.stop();
+        // onstop will handle the no-data error
+      }
+    }, 10_000);
   });
 }
 
